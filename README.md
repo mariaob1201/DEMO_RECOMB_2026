@@ -97,8 +97,8 @@ For each gene (row) *i* with estimated intervention strength β_i:
 where:
 - λ is the base regularization parameter
 - β̄ is the mean absolute intervention strength
-- Genes with weaker interventions (smaller |β_i|) get larger penalties
-- Genes with stronger interventions (larger |β_i|) get smaller penalties
+- Genes with weaker interventions (smaller |β_i|) get smaller penalties
+- Genes with stronger interventions (larger |β_i|) get larger penalties
 
 This is implemented in the C++ ADMM solver ([src/adapre_inspre_cpp.cpp](src/adapre_inspre_cpp.cpp)) through the `adaptive_lambda` parameter in functions `fit_V_VU_const` and `fit_V_UV_const`.
 
