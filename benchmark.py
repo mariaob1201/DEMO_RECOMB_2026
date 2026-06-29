@@ -1,27 +1,34 @@
 """
-benchmark.py — compare ADAPRE (baseline) against alternative causal discovery methods.
+benchmark.py — compare ADAPRE against alternative causal discovery methods.
 
-Methods compared
-----------------
-ADAPRE          : adaptive-lambda inspre (this repo) — the baseline
-inspre_baseline : uniform-lambda inspre (this repo, adaptive_lambda=False)
-DAGMA_control   : DAGMA on control cells only (pure observational)
-DAGMA_all       : DAGMA on all cells, ignoring intervention labels
-SEN             : Semantic Expression Network (new method, this file)
+Methods
+-------
+ADAPRE          baseline (this repo): IV-regression TCE → ADMM (adaptive λ)
+SEN_ADMM        Semantic Expression Network TCE → same ADMM (uniform λ)
+SEN_ADAPRE      Semantic Expression Network TCE → same ADMM (adaptive λ)
+DAGMA_control   DAGMA on control cells only  (pure observational)
+DAGMA_all       DAGMA on all cells, ignoring intervention labels
+
+Key design: SEN and ADAPRE share the exact same ADMM solver (R/run_inspre_on_tce.R
+called via subprocess). The only variable between them is the TCE estimation
+strategy — IV regression (ADAPRE) vs semantic smoothing (SEN).
 
 Usage
 -----
-1. Run run_adapre_demo.R to generate output/
-2. pip install -r requirements.txt
-3. python benchmark.py
+1.  Rscript run_adapre_demo.R     # generates output/ CSVs
+2.  pip install -r requirements.txt
+3.  python benchmark.py
 
 Outputs
 -------
-output/benchmark_results.csv     best-F1 metrics per method
-output/benchmark_f1_paths.csv    F1 / precision / recall vs hyperparameter
+output/benchmark_results.csv      best-F1 metrics per method
+output/benchmark_f1_paths.csv     metrics across hyperparameter sweep
+output/sen_similarity_matrix.csv  gene-gene semantic similarity (D×D)
 """
 
 import os
+import subprocess
+import tempfile
 import warnings
 import numpy as np
 import pandas as pd
@@ -30,7 +37,50 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 OUTPUT_DIR = "output"
-EDGE_THR = 0.001  # matches the threshold used in run_adapre_demo.R
+EDGE_THR   = 0.001   # matches run_adapre_demo.R
+R_HELPER   = os.path.join("R", "run_inspre_on_tce.R")
+
+
+# ---------------------------------------------------------------------------
+# ADMM via subprocess  (calls R/run_inspre_on_tce.R)
+# ---------------------------------------------------------------------------
+
+def admm_on_tce(R_tce_np, adaptive_lambda=False, beta_obs_np=None, nlambda=20):
+    """
+    Run fit_inspre_from_R on a (D,D) TCE matrix by calling R as a subprocess.
+    Returns dict {lambda_value: (D,D) G_hat}, or None on failure.
+    """
+    D = R_tce_np.shape[0]
+    with tempfile.TemporaryDirectory() as tmp:
+        tce_path = os.path.join(tmp, "R_tce.csv")
+        out_path = os.path.join(tmp, "G_hat_long.csv")
+
+        gene_cols = [f"V{i+1}" for i in range(D)]
+        pd.DataFrame(R_tce_np, index=gene_cols, columns=gene_cols).to_csv(tce_path)
+
+        beta_path = ""
+        if beta_obs_np is not None:
+            beta_path = os.path.join(tmp, "beta_obs.csv")
+            pd.DataFrame({"beta_obs": beta_obs_np}).to_csv(beta_path, index=False)
+
+        cmd = ["Rscript", "--vanilla", R_HELPER,
+               tce_path, out_path, str(adaptive_lambda),
+               beta_path, str(nlambda)]
+
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(f"[ADMM] R subprocess failed:\n{proc.stderr[-800:]}")
+            return None
+
+        long_df = pd.read_csv(out_path)
+
+    # Reconstruct dict {lambda: D×D matrix}
+    G_hats = {}
+    for lam, grp in long_df.groupby("lambda"):
+        G = np.zeros((D, D))
+        G[grp["i"].values, grp["j"].values] = grp["G_hat"].values
+        G_hats[float(lam)] = G
+    return G_hats
 
 
 # ---------------------------------------------------------------------------
@@ -52,13 +102,11 @@ def load_data(output_dir=OUTPUT_DIR):
 # ---------------------------------------------------------------------------
 
 def compute_metrics(G_hat, G_true, thr=EDGE_THR):
-    """Precision, recall, F1, AUROC, SHD on off-diagonal entries."""
     D    = G_true.shape[0]
     mask = ~np.eye(D, dtype=bool)
 
-    g_true = G_true[mask]
-    g_hat  = G_hat[mask]
-
+    g_true   = G_true[mask]
+    g_hat    = G_hat[mask]
     true_pos = np.abs(g_true) > thr
     pred_pos = np.abs(g_hat)  > thr
     scores   = np.abs(g_hat)
@@ -82,7 +130,7 @@ def compute_metrics(G_hat, G_true, thr=EDGE_THR):
 
 
 def best_over_sweep(G_hats_dict, G_true, thr=EDGE_THR):
-    """Return metrics at the hyperparameter value that maximises F1."""
+    """Return metrics at the hyperparameter that maximises F1."""
     rows = []
     for param, G_hat in G_hats_dict.items():
         m = compute_metrics(G_hat, G_true, thr)
@@ -94,170 +142,131 @@ def best_over_sweep(G_hats_dict, G_true, thr=EDGE_THR):
 
 
 # ---------------------------------------------------------------------------
-# Method: Semantic Expression Network  (SEN)
+# Semantic Expression Network (SEN)
 # ---------------------------------------------------------------------------
 
 def compute_fingerprints(X, targets, gene_names):
     """
-    Perturbation fingerprint for each gene.
+    Perturbation fingerprint matrix.
 
     delta[i, j] = mean(X_j | gene_i perturbed) - mean(X_j | control)
 
-    Row i encodes "what does the whole transcriptome look like when gene i
-    is knocked down?"  This is the raw, unnormalized TCE signal.
+    Row i: the whole-transcriptome signature of perturbing gene i.
+    This is a noisy, unscaled estimate of the Total Causal Effect row.
     """
     D        = len(gene_names)
-    ctrl_idx = targets == "control"
-    ctrl_mu  = X[ctrl_idx].mean(axis=0)          # (D,)
-
-    delta = np.zeros((D, D))
+    ctrl_mu  = X[targets == "control"].mean(axis=0)
+    delta    = np.zeros((D, D))
     for i, gene in enumerate(gene_names):
         mask = targets == gene
         if mask.sum() > 0:
             delta[i] = X[mask].mean(axis=0) - ctrl_mu
+    return delta
 
-    return delta                                   # (D, D)
 
-
-def normalize_fingerprints_to_tce(delta):
+def fingerprints_to_tce(delta):
     """
-    Convert raw fingerprints to a naive TCE estimate by normalising
-    each row by its own diagonal (self-effect), matching the
-    get_tce() formula used in the R simulation code.
+    Naive TCE estimate: normalise each row by its own diagonal (self-effect).
 
     R_naive[i, j] = delta[i, j] / delta[i, i]
+
+    Matches get_tce() in the R simulation code.
+    The self-effect delta[i,i] plays the same role as beta_obs in IV regression
+    but uses the raw observed mean instead of the IV-corrected estimate.
     """
-    diag_vals  = np.diag(delta)
-    diag_safe  = np.where(np.abs(diag_vals) > 1e-8, diag_vals, 1.0)
-    R_naive    = delta / diag_safe[:, np.newaxis]
+    diag_vals = np.diag(delta)
+    diag_safe = np.where(np.abs(diag_vals) > 1e-8, diag_vals, 1.0)
+    R_naive   = delta / diag_safe[:, np.newaxis]
     np.fill_diagonal(R_naive, 1.0)
     return R_naive
 
 
-def semantic_similarity(delta, n_components):
+def build_semantic_similarity(delta, n_components):
     """
-    Embed gene perturbation fingerprints via PCA and compute pairwise
-    cosine similarity in the embedding space.
+    Embed gene perturbation fingerprints in PCA space and return pairwise
+    cosine similarity.
 
-    Returns
-    -------
-    S : (D, D) float array, values in [0, 1]
-        S[i, j] high  →  gene i and gene j perturb the transcriptome
-                          in similar directions (semantically related)
-    embeddings : (D, n_components) PCA coordinates
+    S[i, j] ≈ 1  →  genes i and j perturb the transcriptome in the same
+                     direction (likely share regulators or are co-regulated)
+    S[i, j] ≈ 0  →  genes i and j have orthogonal causal signatures
     """
-    D            = delta.shape[0]
-    n_components = min(n_components, D - 1)
+    n_components = min(n_components, delta.shape[0] - 1)
+    scaler       = StandardScaler()
+    delta_sc     = scaler.fit_transform(delta)
 
-    scaler      = StandardScaler()
-    delta_sc    = scaler.fit_transform(delta)
+    pca          = PCA(n_components=n_components, random_state=0)
+    embeddings   = pca.fit_transform(delta_sc)                   # (D, k)
 
-    pca         = PCA(n_components=n_components, random_state=0)
-    embeddings  = pca.fit_transform(delta_sc)    # (D, n_components)
-
-    norms       = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
-    emb_unit    = embeddings / norms
-    S           = np.clip(emb_unit @ emb_unit.T, 0, 1)   # (D, D)
+    norms        = np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-8
+    emb_unit     = embeddings / norms
+    S            = np.clip(emb_unit @ emb_unit.T, 0.0, 1.0)     # (D, D)
     return S, embeddings
 
 
 def semantic_smooth(R_naive, S):
     """
-    Smooth the naive TCE matrix by borrowing signal from semantically
-    similar genes.
+    Denoise the naive TCE by borrowing signal from semantically similar genes.
 
-    R_smooth[i, :] = weighted average of R_naive[k, :] for genes k
-                     with high similarity to gene i.
+    R_smooth[i, :] = weighted-average of R_naive[k, :] over genes k,
+                     weighted by S[i, k].
 
-    This denoises the TCE estimate using the global structure of
-    perturbation responses rather than per-entry standard errors.
+    Intuition: if gene i has a similar perturbation fingerprint to gene j,
+    their TCE rows should look similar — pooling reduces estimation noise
+    from small per-gene sample sizes.
     """
-    row_sums  = S.sum(axis=1, keepdims=True) + 1e-8
-    S_norm    = S / row_sums                           # row-stochastic (D, D)
-    return S_norm @ R_naive                            # (D, D)
+    row_sums = S.sum(axis=1, keepdims=True) + 1e-8
+    S_norm   = S / row_sums          # row-stochastic
+    return S_norm @ R_naive          # (D, D)
 
 
-def tce_to_direct_effects(R_smooth):
+def sen_tce(X, targets, gene_names, n_components=10):
     """
-    Recover direct effects from a TCE matrix.
+    Compute the Semantic Expression Network TCE matrix.
 
-    Matches get_direct() in R:  G = I - R_inv / diag(R_inv)  (column-wise)
-    """
-    D = R_smooth.shape[0]
-    try:
-        R_inv = np.linalg.solve(R_smooth, np.eye(D))
-    except np.linalg.LinAlgError:
-        R_inv = np.linalg.pinv(R_smooth)
-
-    diag_R_inv = np.diag(R_inv)
-    diag_safe  = np.where(np.abs(diag_R_inv) > 1e-8, diag_R_inv, 1.0)
-
-    G = np.eye(D) - R_inv / diag_safe[np.newaxis, :]   # column-wise divide
-    np.fill_diagonal(G, 0.0)
-    return G
-
-
-def run_semantic_expression_network(X, targets, gene_names,
-                                    n_components=10, thr_grid=None):
-    """
-    Semantic Expression Network (SEN) — causal graph inference from
-    perturbation fingerprints.
-
-    Algorithm
-    ---------
-    1. Compute perturbation fingerprints Δ from raw expression means.
-    2. Normalise Δ → naive TCE matrix R_naive (row ÷ self-effect).
-    3. Embed genes in PCA space; compute cosine similarity S.
-    4. Semantic smoothing: R_smooth = S_row_norm @ R_naive
-       — each gene's TCE row is a weighted average of similar genes' rows,
-         denoising by exploiting community structure in the network.
-    5. Recover direct effects: G = I - R_smooth^{-1} / diag(R_smooth^{-1})
-    6. Sweep a threshold on |G| to generate a family of graphs for evaluation.
-
-    Parameters
-    ----------
-    X            : (N, D) expression matrix
-    targets      : (N,) array of intervention labels or "control"
-    gene_names   : list of length D
-    n_components : PCA components for semantic embedding
-    thr_grid     : threshold values to sweep; if None, 30 values are used
-
-    Returns
-    -------
-    G_hats : dict {threshold: (D, D) G_hat array}
-    meta   : dict with intermediate quantities (S, embeddings, R_smooth)
+    Returns R_sem (D×D) and auxiliary quantities for inspection.
     """
     delta    = compute_fingerprints(X, targets, gene_names)
-    R_naive  = normalize_fingerprints_to_tce(delta)
-    S, embs  = semantic_similarity(delta, n_components)
-    R_smooth = semantic_smooth(R_naive, S)
-    G_full   = tce_to_direct_effects(R_smooth)
+    R_naive  = fingerprints_to_tce(delta)
+    S, embs  = build_semantic_similarity(delta, n_components)
+    R_sem    = semantic_smooth(R_naive, S)
+    # Self-effect on diagonal: keep =1 to match TCE convention
+    np.fill_diagonal(R_sem, 1.0)
+    meta = dict(delta=delta, R_naive=R_naive, S=S, embeddings=embs)
+    return R_sem, meta
 
-    if thr_grid is None:
-        off_diag    = np.abs(G_full[~np.eye(G_full.shape[0], dtype=bool)])
-        thr_max     = np.percentile(off_diag, 99)
-        thr_grid    = np.linspace(0.0, thr_max, 40)
 
-    G_hats = {}
-    for thr in thr_grid:
-        G_t = G_full.copy()
-        G_t[np.abs(G_t) < thr] = 0.0
-        G_hats[float(thr)] = G_t
+def run_sen_admm(X, targets, gene_names, n_components=10,
+                 adaptive_lambda=False, nlambda=20):
+    """
+    SEN + ADMM: feed the semantic TCE into the same ADMM solver used by ADAPRE.
 
-    meta = dict(S=S, embeddings=embs, R_smooth=R_smooth, G_full=G_full,
-                delta=delta, R_naive=R_naive)
+    When adaptive_lambda=False  →  SEN_ADMM   (uniform λ, different TCE)
+    When adaptive_lambda=True   →  SEN_ADAPRE (adaptive λ, different TCE)
+
+    The self-effect magnitudes |delta[i,i]| are used as beta_obs when
+    adaptive_lambda=True, analogous to ADAPRE's observed instrument strengths.
+    """
+    R_sem, meta = sen_tce(X, targets, gene_names, n_components)
+
+    beta_obs_np = None
+    if adaptive_lambda:
+        # Use |self-effect| as the instrument strength proxy
+        beta_obs_np = np.abs(np.diag(meta['delta']))
+
+    G_hats = admm_on_tce(R_sem, adaptive_lambda=adaptive_lambda,
+                          beta_obs_np=beta_obs_np, nlambda=nlambda)
     return G_hats, meta
 
 
 # ---------------------------------------------------------------------------
-# Method: DAGMA variants
+# DAGMA variants
 # ---------------------------------------------------------------------------
 
 def run_dagma(X_fit, lambda_grid=None, w_threshold=EDGE_THR, label=""):
     try:
         from dagma.linear import DagmaLinear
     except ImportError:
-        print(f"[DAGMA{label}] dagma not installed — skipping. pip install dagma")
+        print(f"[DAGMA{label}] not installed — skipping.  pip install dagma")
         return None
 
     if lambda_grid is None:
@@ -267,15 +276,14 @@ def run_dagma(X_fit, lambda_grid=None, w_threshold=EDGE_THR, label=""):
     for lam in lambda_grid:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            model = DagmaLinear(loss_type="l2")
-            W     = model.fit(X_fit, lambda1=lam, w_threshold=w_threshold)
+            W = DagmaLinear(loss_type="l2").fit(
+                X_fit, lambda1=lam, w_threshold=w_threshold)
         G_hats[float(lam)] = W
-
     return G_hats
 
 
 # ---------------------------------------------------------------------------
-# Main benchmark
+# Main
 # ---------------------------------------------------------------------------
 
 def main():
@@ -285,66 +293,70 @@ def main():
     all_results = {}
     all_paths   = {}
 
-    # -- ADAPRE (baseline, pre-fit in R) -------------------------------------
+    def record(label, G_hats_dict):
+        best_m, path_df = best_over_sweep(G_hats_dict, G_true)
+        all_results[label] = best_m
+        path_df["method"]  = label
+        all_paths[label]   = path_df
+        print(f"[{label:<20}]  "
+              f"F1={best_m['F1']:.4f}  "
+              f"AUROC={best_m['AUROC']:.4f}  "
+              f"SHD={int(best_m['SHD'])}")
+
+    # -- ADAPRE (baseline, pre-fit in R) ------------------------------------
     m = compute_metrics(G_hat_adapre, G_true)
     m["param"] = float("nan")
     all_results["ADAPRE"] = m
-    print(f"[ADAPRE]           F1={m['F1']:.4f}  AUROC={m['AUROC']:.4f}  SHD={m['SHD']}")
+    print(f"[{'ADAPRE':<20}]  "
+          f"F1={m['F1']:.4f}  AUROC={m['AUROC']:.4f}  SHD={m['SHD']}")
 
-    # -- SEN: Semantic Expression Network ------------------------------------
-    print("\nFitting Semantic Expression Network (SEN)...")
-    for n_comp in [5, 10, 20]:
-        label = f"SEN_pca{n_comp}"
-        G_hats_sen, sen_meta = run_semantic_expression_network(
-            X, targets, gene_names, n_components=n_comp
-        )
-        best_m, path_df = best_over_sweep(G_hats_sen, G_true)
-        all_results[label] = best_m
-        path_df["method"] = label
-        all_paths[label]  = path_df
-        print(f"[{label}]    F1={best_m['F1']:.4f}  AUROC={best_m['AUROC']:.4f}  SHD={best_m['SHD']}")
+    # -- SEN + ADMM (uniform λ) — same solver as ADAPRE, semantic TCE -------
+    n_pca = 10   # number of PCA components for semantic embedding
+    print(f"\nFitting SEN_ADMM  (semantic TCE, uniform λ,   pca={n_pca})...")
+    G_hats_sen, sen_meta = run_sen_admm(X, targets, gene_names,
+                                        n_components=n_pca,
+                                        adaptive_lambda=False)
+    if G_hats_sen:
+        record("SEN_ADMM", G_hats_sen)
+        np.savetxt(os.path.join(OUTPUT_DIR, "sen_similarity_matrix.csv"),
+                   sen_meta["S"], delimiter=",")
 
-    # Save similarity matrix from best SEN variant for inspection
-    np.savetxt(os.path.join(OUTPUT_DIR, "sen_similarity_matrix.csv"),
-               sen_meta["S"], delimiter=",")
+    # -- SEN + ADAPRE (adaptive λ) — semantic TCE + adaptive λ ---------------
+    print(f"\nFitting SEN_ADAPRE (semantic TCE, adaptive λ, pca={n_pca})...")
+    G_hats_sen_adap, _ = run_sen_admm(X, targets, gene_names,
+                                       n_components=n_pca,
+                                       adaptive_lambda=True)
+    if G_hats_sen_adap:
+        record("SEN_ADAPRE", G_hats_sen_adap)
 
-    # -- DAGMA: control cells only -------------------------------------------
+    # -- DAGMA: control cells only ------------------------------------------
     print("\nFitting DAGMA (control cells only)...")
-    X_ctrl = X[targets == "control"]
-    G_hats_dagma_ctrl = run_dagma(X_ctrl, label="_control")
-    if G_hats_dagma_ctrl is not None:
-        best_m, path_df = best_over_sweep(G_hats_dagma_ctrl, G_true)
-        all_results["DAGMA_control"] = best_m
-        path_df["method"] = "DAGMA_control"
-        all_paths["DAGMA_control"] = path_df
-        print(f"[DAGMA_control]    F1={best_m['F1']:.4f}  AUROC={best_m['AUROC']:.4f}  SHD={best_m['SHD']}")
+    G_hats_dagma_ctrl = run_dagma(X[targets == "control"], label="_control")
+    if G_hats_dagma_ctrl:
+        record("DAGMA_control", G_hats_dagma_ctrl)
 
-    # -- DAGMA: all observations (ignores intervention labels) ---------------
-    print("\nFitting DAGMA (all observations, no target labels)...")
+    # -- DAGMA: all observations (ignores labels) ----------------------------
+    print("\nFitting DAGMA (all observations, no labels)...")
     G_hats_dagma_all = run_dagma(X, label="_all")
-    if G_hats_dagma_all is not None:
-        best_m, path_df = best_over_sweep(G_hats_dagma_all, G_true)
-        all_results["DAGMA_all"] = best_m
-        path_df["method"] = "DAGMA_all"
-        all_paths["DAGMA_all"] = path_df
-        print(f"[DAGMA_all]        F1={best_m['F1']:.4f}  AUROC={best_m['AUROC']:.4f}  SHD={best_m['SHD']}")
+    if G_hats_dagma_all:
+        record("DAGMA_all", G_hats_dagma_all)
 
-    # -- Save results --------------------------------------------------------
+    # -- Summary table -------------------------------------------------------
     cols       = ["precision", "recall", "F1", "AUROC", "SHD"]
     results_df = pd.DataFrame(all_results).T[cols].round(4)
 
     print("\n=== Benchmark Results (best F1 per method) ===")
     print(results_df.to_string())
 
-    out_path = os.path.join(OUTPUT_DIR, "benchmark_results.csv")
-    results_df.to_csv(out_path)
-    print(f"\nSaved to {out_path}")
+    out = os.path.join(OUTPUT_DIR, "benchmark_results.csv")
+    results_df.to_csv(out)
+    print(f"\nSaved {out}")
 
     if all_paths:
-        paths_df  = pd.concat(all_paths.values(), ignore_index=True)
+        paths_df = pd.concat(all_paths.values(), ignore_index=True)
         paths_out = os.path.join(OUTPUT_DIR, "benchmark_f1_paths.csv")
         paths_df.to_csv(paths_out, index=False)
-        print(f"Saved F1 paths to {paths_out}")
+        print(f"Saved {paths_out}")
 
 
 if __name__ == "__main__":

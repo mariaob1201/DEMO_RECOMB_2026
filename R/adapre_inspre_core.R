@@ -159,6 +159,8 @@ inspre_worker <- function(X, W = NULL, rho = 1.0, lambda = 0.01,
   max_wrong_way <- 3
   wrong_way <- 0
 
+  if (is.null(beta_obs)) beta_obs <- numeric(0)
+
   start_time <- Sys.time()
   WX <- W * X
   WX[is.na(WX)] <- 0
