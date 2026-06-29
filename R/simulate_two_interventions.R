@@ -6,6 +6,81 @@
 # Commits on Sep 4, 2025
 # https://github.com/brielin/inspre/commits/master/R/simulate.R
 
+# ---------------------------------------------------------------------------
+# Network generation helpers (copied from inspre::simulate.R so the repo has
+# no dependency on the inspre package at runtime).
+# ---------------------------------------------------------------------------
+
+scale_free <- function(D, p = 0.5, DAG = FALSE, a_in = 1, a_out = 1) {
+  A <- matrix(c(0, 0, 1, 0), nrow = 2)
+  while (nrow(A) < D) {
+    d_in  <- colSums(A)
+    d_out <- rowSums(A)
+    choice   <- stats::runif(1)
+    D_curr   <- nrow(A)
+    if (choice < p) {
+      v      <- sample(D_curr, 1, prob = d_out + a_out)
+      a_next <- rep(0, D_curr)
+      a_next[v] <- 1
+      A <- rbind(cbind(A, a_next, deparse.level = 0), rep(0, D_curr + 1))
+    } else {
+      repeat {
+        v <- sample(D_curr, 1, prob = d_out + a_out)
+        w <- sample(D_curr, 1, prob = log(d_in + a_in))
+        if (DAG) {
+          if (v < w) break
+        } else if (v != w && A[w, v] == 0) break
+      }
+      A[v, w] <- 1
+    }
+  }
+  return(A)
+}
+
+random_graph <- function(D, p = 3 / D, DAG = FALSE) {
+  A <- matrix(as.integer(stats::runif(D * D) < (DAG + 1) * p), nrow = D)
+  diag(A) <- 0
+  if (DAG) {
+    perm <- sample.int(D)
+    A <- A[perm, perm]
+    A <- A * upper.tri(A)
+  }
+  return(A)
+}
+
+#' Simulates a random weighted graph.
+#'
+#' Adapted from inspre::generate_network (brielin/inspre, Sep 2025).
+#'
+#' @param D Integer. Number of nodes.
+#' @param graph String. "scalefree" or "random".
+#' @param p Float. Edge probability parameter.
+#' @param v Float. Mode of PERT distribution for edge weights.
+#' @param DAG Logical. TRUE to restrict to a DAG.
+#' @param max_eig Float. Maximum spectral radius (for stability).
+generate_network <- function(D, graph = "scalefree", p = 0.4, v = 0.2,
+                             DAG = FALSE, max_eig = 0.9) {
+  if (graph == "scalefree") {
+    A <- scale_free(D, p, DAG)
+  } else if (graph == "random") {
+    A <- random_graph(D, p, DAG)
+  } else {
+    stop("graph must be 'scalefree' or 'random'.")
+  }
+  G <- A
+  G[A != 0] <- sample(c(1, -1), sum(A), replace = TRUE) *
+    mc2d::rpert(sum(A), min = v / 2, mode = v, max = 2 * v)
+  rg <- Mod(eigen(G, only.values = TRUE)$values)[1]
+  if (rg > max_eig) G <- G * (max_eig / rg)
+  rownames(G) <- paste0("V", 1:D)
+  colnames(G) <- paste0("V", 1:D)
+  return(G)
+}
+
+generate_data_knockout <- function(G, N_cont, N_int, noise = "gaussian") {
+  stop("generate_data_knockout is not used in this demo (model='inhibition' only).")
+}
+
 # --- helper: generate_data_inhibition_two_int ---
 # Supports N_int of length 1, 2, or D
 generate_data_inhibition_two_int <- function(

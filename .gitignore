@@ -1,0 +1,15 @@
+# Large generated outputs — regenerate by running run_adapre_demo.R
+output/X.csv
+output/targets.csv
+output/sim_data.RData
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# R
+.Rhistory
+.RData
+*.Rproj.user/

@@ -4,11 +4,10 @@
 ## using the local implementation in this folder.
 
 suppressPackageStartupMessages({
-library(Rcpp)
-library(dplyr)
+  library(Rcpp)
+  library(dplyr)
   library(purrr)
   library(ggplot2)
-  library(inspre)
 })
 
 
@@ -198,17 +197,16 @@ select_best_by_f1 <- function(res, G_true, thr = 0.001) {
   )
 }
 
-## Baseline: inspre package fit_inspre_from_X (UV-like constraint)
-cat("\nFitting baseline inspre (package)...\n")
-# Suppress console output from inspre package
-sink(tempfile())
-fit_inspre_pkg <- inspre::fit_inspre_from_X(
+## Baseline: local fit_inspre_from_X, no adaptive lambda (standard inspre behaviour)
+cat("\nFitting baseline (local inspre, adaptive_lambda = FALSE)...\n")
+fit_inspre_pkg <- fit_inspre_from_X(
   X = Y,
   targets = targets,
   weighted = TRUE,
-  verbose = 0
+  verbose = 0,
+  constraint = "UV",
+  adaptive_lambda = FALSE
 )
-sink()
 eval_inspre <- evaluate_fit(fit_inspre_pkg, G)
 
 ## ADAPRE, UV constraint (our implementation with adaptive lambda)
@@ -242,6 +240,21 @@ print(summary_table)
 
 ## Save summary table
 write.csv(summary_table, file.path(output_dir, "summary_best_f1.csv"), row.names = FALSE)
+
+## Export data for Python benchmark harness
+write.csv(Y,
+          file.path(output_dir, "X.csv"), row.names = FALSE)
+write.csv(data.frame(target = targets),
+          file.path(output_dir, "targets.csv"), row.names = FALSE)
+write.csv(fit_adapre$R_hat,
+          file.path(output_dir, "R_hat_tce.csv"))
+write.csv(as.data.frame(G),
+          file.path(output_dir, "G_true.csv"), row.names = FALSE)
+write.csv(data.frame(gene = paste0("V", seq_along(int_beta)), beta_obs = int_beta),
+          file.path(output_dir, "beta_obs.csv"), row.names = FALSE)
+write.csv(as.data.frame(best_adapre$G_hat),
+          file.path(output_dir, "G_hat_adapre.csv"), row.names = FALSE)
+cat("  - X.csv, targets.csv, R_hat_tce.csv, G_true.csv, beta_obs.csv, G_hat_adapre.csv\n")
 
 ## Compare adaptive vs baseline networks (best-F1 lambda)
 # Removed correlation print to reduce output clutter
