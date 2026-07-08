@@ -69,7 +69,10 @@ f1_at_best <- function(G_hat_arr, lambda_vec, G_true_full, gene_names, thr = 0.0
 }
 
 cat("\nFitting ADAPRE independently per donor (naive baseline)...\n")
-results <- data.frame()
+results      <- data.frame()
+donor_R_hats <- vector("list", K_donors)  # save TCE matrices for tensor regression
+donor_G_hats <- vector("list", K_donors)  # save best-lambda G_hat per donor
+
 for (k in seq_len(K_donors)) {
   d <- pop$donor_data[[k]]
   G_true_named <- pop$donor_graphs[[k]]
@@ -94,6 +97,35 @@ for (k in seq_len(K_donors)) {
     donor = k, F1 = f1, genes_retained = length(genes_kept),
     n_unstable_lambdas = n_unstable_k, n_lambdas = length(res$lambda)
   ))
+
+  # ---- Save TCE matrix (D×D, with gene names as row/col names) ----
+  R_full <- matrix(NA, nrow = D, ncol = D,
+                   dimnames = list(paste0("V", 1:D), paste0("V", 1:D)))
+  R_full[genes_kept, genes_kept] <- res$R_hat
+  donor_R_hats[[k]] <- R_full
+  write.csv(R_full, file.path(output_dir, sprintf("R_hat_donor%d.csv", k)))
+
+  # ---- Save G_hat at the lambda that maximises F1 ----
+  G_full <- matrix(0, nrow = D, ncol = D,
+                   dimnames = list(paste0("V", 1:D), paste0("V", 1:D)))
+  G_true_sub <- G_true_named[genes_kept, genes_kept]
+  mask_sub <- !diag(length(genes_kept))
+  true_pos_sub <- abs(G_true_sub[mask_sub]) > 0.05
+  best_f1 <- -1; best_k_lam <- 1
+  for (k_lam in seq_along(res$lambda)) {
+    g_k <- res$G_hat[, , k_lam][mask_sub]
+    if (any(is.na(g_k)) || any(is.infinite(g_k))) next
+    pred_pos <- abs(g_k) > 0.05
+    tp <- sum(pred_pos & true_pos_sub); fp <- sum(pred_pos & !true_pos_sub)
+    fn <- sum(!pred_pos & true_pos_sub)
+    pr <- if (tp + fp > 0) tp / (tp + fp) else 0
+    re <- if (tp + fn > 0) tp / (tp + fn) else 0
+    f1_k <- if (pr + re > 0) 2 * pr * re / (pr + re) else 0
+    if (f1_k > best_f1) { best_f1 <- f1_k; best_k_lam <- k_lam }
+  }
+  G_full[genes_kept, genes_kept] <- res$G_hat[, , best_k_lam]
+  donor_G_hats[[k]] <- G_full
+  write.csv(G_full, file.path(output_dir, sprintf("G_hat_donor%d.csv", k)))
 }
 
 cat(sprintf("\n=== Summary: independent per-donor ADAPRE ===\n"))
